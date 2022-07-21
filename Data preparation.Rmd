@@ -1,0 +1,145 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+Set up
+```{r message=FALSE, warning =FALSE}
+library(dplyr)
+library(ggplot2)
+library(sqldf)
+library(ROCR)
+library(purrr)
+Data = read.csv("Cleaned Data.csv", header = T)
+```
+
+
+## Further data preparations
+
+Selecting columns to be used in the classification.
+```{r message=FALSE, warning =FALSE}
+# Selecting data to use in analysis.
+
+analysis_data = subset(Data,select = c("MINE_ID", "CONTROLLER_ID", "OPERATOR_ID", "SUBUNIT", "UG_LOCATION", "CAL_YR","UG_MINING_METHOD", "COAL_METAL_IND","CONTRACTOR_ID", "DEGREE_INJURY", "TOT_EXPER", "OCCUPATION" , "SHIFT_BEGIN_TIME","ACTIVITY"))
+
+
+```
+The predictor variables were chosen following the relationships discovered in the exploratory data analysis stage.
+
+
+
+#### Creating target variable 
+```{r}
+analysis_data = mutate(analysis_data,
+                       LEVEL = ifelse((DEGREE_INJURY =="PERM TOT OR PERM PRTL DISABLTY" | DEGREE_INJURY == "FATALITY"), 1, 0))
+
+for(vr in names(analysis_data)){
+  analysis_data[,vr]= na_if(analysis_data[,vr],"NO VALUE FOUND")
+  
+  
+}
+analysis_data$MINE_ID = as.factor(analysis_data$MINE_ID)
+#CRITICA == 1 NON_CRITICAL == 0
+pos_label = 1
+```
+
+#### checking balance of response variable
+```{r}
+resp_tab = table(analysis_data$LEVEL)
+round(prop.table(x = resp_tab), 3)
+```
+The data is skewed in favour of Non-critical injuries. Where non-critical injuries make up more than 98.7 percent of the data set.We will not alter the data set but choose comparison stats that account for the skew in data. 
+
+#### Splitting data
+
+Since we will be using the model to predict future incidents, I will split the data by years.With a 0.9, 0.1 split.
+```{r}
+# find cumulative function over years.
+prop = function(x, column1, column2 ){
+  year_level_table = prop.table(table(x[,column1],x[, column2]))
+  year_level_table = cbind(year_level_table, cumsum(year_level_table[,1] + year_level_table[,2]))
+  
+  colnames(year_level_table)[3] <- "CUMULATIVE"
+  year_level_table
+}
+
+prop(analysis_data, "CAL_YR", "LEVEL")
+# split the data at 2013 since this will give an approximat 0.9, 0.1 split
+
+split_data  = function(x, split_column, split_date){
+  rvalue = x[,split_column]
+  list(x[rvalue <= split_date, ], x[rvalue > split_date, ])
+}
+training_test_data = split_data(analysis_data,"CAL_YR", 2012)
+training_calibration_data = training_test_data[[1]]
+test_data = training_test_data[[2]]
+
+rm(training_test_data)
+```
+Splitting training into calibration and training sets.
+```{r}
+prop(training_calibration_data, "CAL_YR", "LEVEL")
+train_calibratrion_data = split_data(training_calibration_data,"CAL_YR", 2010)
+training_data = train_calibratrion_data[[1]]
+calibration_data = train_calibratrion_data[[2]]
+
+```
+
+
+
+Single varible pred values
+
+```{r}
+
+## code adopted from WEEK 9 lecture Prepared by Dr Du Huynh for Demonstrative purposes.
+mkPredC <- function(outCol,varCol,appCol, pos=pos_label) {
+  pPos <- sum(outCol==pos)/length(outCol)
+  naTab <- table(as.factor(outCol[is.na(varCol)]))
+  pPosWna <- (naTab/sum(naTab))[pos]
+  vTab <- table(as.factor(outCol),varCol)
+  pPosWv <- (vTab[pos,]+1.0e-3*pPos)/(colSums(vTab)+1.0e-3)
+  pred <- pPosWv[appCol]
+  pred[is.na(appCol)] <- pPosWna
+  pred[is.na(pred)] <- pPos
+  pred
+}
+
+
+```
+```{r}
+outcome = "LEVEL"
+
+## Making predictions for all three data sets.
+for(v in cat_vars) {
+  cname <- paste('pred',v,sep='')
+  training_data[,cname] <- mkPredC(training_data[,outcome], training_data[,v], training_data[,v])
+  calibration_data[,cname] <- mkPredC(training_data[,outcome], training_data[,v], calibration_data[,v])
+  test_data[,cname] <- mkPredC(training_data[,outcome], training_data[,v], test_data[,v])
+}
+```
+
+```{r}
+# Prediction function for numerical variables
+mkPredN <- function(outCol,varCol,appCol) {
+  cuts <- unique(as.numeric(quantile(varCol, probs=seq(0, 1, 0.1), na.rm=T)))
+  varC <- cut(varCol, cuts)
+  appC <- cut(appCol, cuts)
+  mkPredC(outCol, varC, appC)
+}
+```
+
+```{r}
+for(v in num_vars) {
+  cname <- paste('pred',v,sep='')
+  training_data[,cname] <- mkPredN(training_data[,outcome], training_data[,v], training_data[,v])
+  calibration_data[,cname] <- mkPredN(training_data[,outcome], training_data[,v], calibration_data[,v])
+  test_data[,cname] <- mkPredN(training_data[,outcome], training_data[,v], test_data[,v])
+  
+  aucTrain <- calcAUC(training_data[,cname],training_data[,outcome])
+  if(aucTrain>=0.4) {
+    aucCal <- calcAUC(calibration_data[,cname],calibration_data[,outcome])
+    print(sprintf(
+      "%s, trainAUC: %4.3f calibrationAUC: %4.3f",
+      cname, aucTrain, aucCal))
+  }
+}
+```
