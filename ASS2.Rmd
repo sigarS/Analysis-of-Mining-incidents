@@ -1,0 +1,777 @@
+---
+title: "ASS2"
+output: html_notebook
+---
+## Introduction
+In this analysis, I separate the Degree of injury into Non-Critical and Critical. Critical injuries are ones that result in Permanent total or Permanent partial Disabilities, or Fatalities; Non-critical injuries are everything else.
+I then perform classification on this data to determine if there are any relationships between the regressors and critical or non-critical injuries. 
+
+I then perform Clustering on the data without the response variable to ascertain if there are common patterns in the data that cannot be picked up by regression classification algorithms.
+
+
+# Set up
+```{r message=FALSE, warning =FALSE}
+library(dplyr)
+library(ggplot2)
+library(sqldf)
+library(ROCR)
+library(purrr)
+library(lime)
+library(xgboost)
+library(ggthemes)
+library(ggpubr)
+library(fpc)
+
+Data = read.csv("Cleaned Data.csv", header = T)
+ass2_theme <- theme_few() +
+                  theme(axis.text.y=element_text(size=rel(0.8)))+
+                  theme(plot.margin=margin(10,30,10,30))+
+                  grids(linetype ="dashed", color = "black", size = 0.5)
+```
+
+
+### Further data preparations
+
+Selecting columns to be used in the classification.
+```{r message=FALSE, warning =FALSE}
+# Selecting data to use in analysis.
+
+analysis_data = subset(Data,select = c("MINE_ID", "CONTROLLER_ID", "OPERATOR_ID", "SUBUNIT", "UG_LOCATION", "CAL_YR","UG_MINING_METHOD", "COAL_METAL_IND","CONTRACTOR_ID", "DEGREE_INJURY", "ACCIDENT_TYPE" ,"ACCIDENT_TIME", "ACCIDENT_TIME_isBAD", "TOT_EXPER","CLASSIFICATION", "OCCUPATION" , "SHIFT_BEGIN_TIME", "SHIFT_BEGIN_TIME_isBAD","ACTIVITY", "MINING_EQUIP"))
+
+
+```
+The predictor variables were chosen following the relationships discovered in the exploratory data analysis stage.
+
+
+
+### Creating target variable 
+```{r}
+analysis_data = mutate(analysis_data,
+                       LEVEL = ifelse((DEGREE_INJURY =="PERM TOT OR PERM PRTL DISABLTY" | DEGREE_INJURY == "FATALITY"), 1, 0))
+
+for(vr in names(analysis_data)){
+  analysis_data[,vr]= na_if(analysis_data[,vr],"NO VALUE FOUND")
+  
+  
+}
+analysis_data$MINE_ID = as.factor(analysis_data$MINE_ID)
+#CRITICA == 1 NON_CRITICAL == 0
+pos_label = 1
+```
+
+### checking balance of response variable
+```{r}
+resp_tab = table(analysis_data$LEVEL)
+round(prop.table(x = resp_tab), 3)
+```
+The data is skewed in favour of Non-critical injuries. Where non-critical injuries make up around 98.7 percent of the data set.I  will not alter the data set but choose comparison stats that account for the skew in data. 
+
+### Splitting data
+
+Since I  will be using the model to predict future incidents, I will split the data by years.With a 0.9, 0.1 split.
+```{r}
+# find cumulative function over years.
+prop = function(x, column1, column2 ){
+  year_level_table = prop.table(table(x[,column1],x[, column2]))
+  year_level_table = cbind(year_level_table, cumsum(year_level_table[,1] + year_level_table[,2]))
+  
+  colnames(year_level_table)[3] <- "CUMULATIVE"
+  
+}
+
+prop(analysis_data, "CAL_YR", "LEVEL")
+# split the data at 2013 since this will give an approximat 0.9, 0.1 split
+
+split_data  = function(x, split_column, split_date){
+  rvalue = x[,split_column]
+  list(x[rvalue <= split_date, ], x[rvalue > split_date, ])
+}
+training_test_data = split_data(analysis_data,"CAL_YR", 2012)
+training_calibration_data = training_test_data[[1]]
+test_data = training_test_data[[2]]
+
+rm(training_test_data)
+```
+Splitting training into calibration and training sets.
+```{r}
+prop(training_calibration_data, "CAL_YR", "LEVEL")
+train_calibratrion_data = split_data(training_calibration_data,"CAL_YR", 2010)
+training_data = train_calibratrion_data[[1]]
+calibration_data = train_calibratrion_data[[2]]
+
+```
+The training, calibration and test data are derived from the original data set, where training data-set has every data point with calender year<= 2010, calibration data-set  has every data point  in the interval 2010< calender year <=2012,test set has every data point >2013
+
+
+Splitting the variables into Categorical and numerical variables
+```{r}
+
+cat_vars = setdiff(names(training_data[,lapply(training_data, class) %in% c('factor','character')]),c("LEVEL","DEGREE_INJURY"))
+num_vars = setdiff(names(training_data[,lapply(training_data, class) %in% c('numeric','integer')]),c("LEVEL","DEGREE_INJURY"))
+```
+# Classification
+## Implement Base models i.e single variable model
+
+```{r}
+
+## code adopted from WEEK 9 lecture Prepared by Dr Du Huynh for Demonstrative purposes.
+mkPredC <- function(outCol,varCol,appCol, pos=pos_label) {
+  pPos <- sum(outCol==pos)/length(outCol)
+  naTab <- table(as.factor(outCol[is.na(varCol)]))
+  pPosWna <- (naTab/sum(naTab))[pos]
+  vTab <- table(as.factor(outCol),varCol)
+  pPosWv <- (vTab[pos,]+1.0e-3*pPos)/(colSums(vTab)+1.0e-3)
+  pred <- pPosWv[appCol]
+  pred[is.na(appCol)] <- pPosWna
+  pred[is.na(pred)] <- pPos
+  pred
+}
+
+
+```
+
+```{r}
+outcome = "LEVEL"
+
+## Making predictions for all three data sets.
+for(v in cat_vars) {
+  cname <- paste('pred',v,sep='')
+  training_data[,cname] <- mkPredC(training_data[,outcome], training_data[,v], training_data[,v])
+  calibration_data[,cname] <- mkPredC(training_data[,outcome], training_data[,v], calibration_data[,v])
+  test_data[,cname] <- mkPredC(training_data[,outcome], training_data[,v], test_data[,v])
+}
+```
+
+## Evaluating Single variable Models
+
+### Categorical variable
+```{r}
+
+
+calcAUC <- function(predcol, outcol, pos=pos_label) {
+  perf <- performance(prediction(predcol, outcol==pos),'auc')
+  as.numeric(perf@y.values)
+}
+
+for(v in cat_vars) {
+  cname <- paste('pred',v,sep='')
+  aucTrain <- calcAUC(training_data[,cname],training_data[,outcome])
+  if(aucTrain>=0.4) {
+    aucCal <- calcAUC(calibration_data[,cname],calibration_data[,outcome])
+    print(sprintf(
+      "%s, trainAUC: %4.3f calibrationAUC: %4.3f",
+      cname, aucTrain, aucCal))
+  }
+}
+
+
+```
+These single variable model have AUC less than 0.5 mark with the best 
+single variable model being one made from COAL_METAL_IND. To get a more concrete answer, I perform a 5-fold cross validation bellow.
+
+##### 5 fold cross validation
+```{r}
+for (var in cat_vars) {
+  aucs = rep(0,5)
+  for (i in seq(0,4)) {
+    cal = analysis_data$CAL_YR >=  i*3+2000 & analysis_data$CAL_YR <= i *3 +2003
+    
+    predRep <- mkPredC(analysis_data[!cal, outcome],
+                       analysis_data[!cal, var],
+                       analysis_data[cal, var])
+    aucs[i+1] <- calcAUC(predRep, analysis_data[cal, outcome])
+  }
+  print(sprintf("%s: mean: %4.3f; sd: %4.3f", var, mean(aucs), sd(aucs)))
+}
+```
+With the 5-fold cross validation, the UG_location variable is the best single variable model for categorical variables; AUC of 0.49. The initial auc prediction were underestimates for the top 5 variables.
+
+
+```{r}
+# Eliminating variables
+cat_vars = setdiff(cat_vars, c("OCCUPATION", "ACTIVITY", "CLASSIFICATION", "ACCIDENT_TYPE", "MINING_EQUIP"))
+```
+
+
+```{r}
+ggplot(data=calibration_data) +
+  geom_density(aes(x=predUG_LOCATION,color=as.factor(LEVEL))) + 
+  ass2_theme
+```
+
+
+```{r}
+
+library(ROCit)
+plot_roc <- function(predcol, outcol, colour_id=2, overlaid=F) {
+ROCit_obj <- rocit(score=predcol, class=outcol==pos_label)
+par(new=overlaid)
+plot(ROCit_obj, col = c(colour_id, 1),
+legend = FALSE, YIndex = FALSE, values = FALSE)
+}
+plot_roc(calibration_data$predSUBUNIT, calibration_data[, outcome])
+```
+Even though the UG_location single variable model is the best categorical model, its is barely able to differentiate between the two LEVELS of injuries.
+The double density plot shows that there is considerable overlap between the density of the two injury levels, with no descernable threshold value to separate the two classes. Thus, changing the threshold value will not produce a better results as the model is unable to differentiate between the two classes.
+
+### numerical variables
+
+```{r}
+# Prediction function for numerical variables
+mkPredN <- function(outCol,varCol,appCol) {
+  cuts <- unique(as.numeric(quantile(varCol, probs=seq(0, 1, 0.1), na.rm=T)))
+  varC <- cut(varCol, cuts)
+  appC <- cut(appCol, cuts)
+  mkPredC(outCol, varC, appC)
+}
+```
+
+```{r}
+for(v in num_vars) {
+  cname <- paste('pred',v,sep='')
+  training_data[,cname] <- mkPredN(training_data[,outcome], training_data[,v], training_data[,v])
+  calibration_data[,cname] <- mkPredN(training_data[,outcome], training_data[,v], calibration_data[,v])
+  test_data[,cname] <- mkPredN(training_data[,outcome], training_data[,v], test_data[,v])
+  
+  aucTrain <- calcAUC(training_data[,cname],training_data[,outcome])
+  if(aucTrain>=0.4) {
+    aucCal <- calcAUC(calibration_data[,cname],calibration_data[,outcome])
+    print(sprintf(
+      "%s, trainAUC: %4.3f calibrationAUC: %4.3f",
+      cname, aucTrain, aucCal))
+  }
+}
+```
+Of the three numeric variable, the time that the shift Begins coupled with it "isBAD" counter part, seem to be a defining factor but I need to perform cross validation analysis to get a clearer result. An interesting observation here is that the training AUC is lower than the test AUC, for year and the shift start time.
+
+
+
+##### 5-fold Cross validation
+```{r}
+for (var in num_vars) {
+  aucs = rep(0,5)
+  for (i in seq(0,4)) {
+    cal = analysis_data$CAL_YR >=  i*3+2000 & analysis_data$CAL_YR <= i *3 +2003
+    
+    predRep <- mkPredN(analysis_data[!cal, outcome],
+                       analysis_data[!cal, var],
+                       analysis_data[cal, var])
+    aucs[i+1] <- calcAUC(predRep, analysis_data[cal, outcome])
+  }
+  print(sprintf("%s: mean: %4.3f; sd: %4.3f", var, mean(aucs), sd(aucs)))
+}
+```
+With cross validation, calender year becomes the most important variable for the single variable models, being the only model with an AUC of 0.5. Another interesting observation is, the calender Years AUC has a standard deviation of 0.
+
+# Multi Variable Models
+
+### Model Evaluation
+```{r}
+plot_roc2 <- function(predcol1, outcol1, predcol2, outcol2){
+  roc_1 <- rocit(score=predcol1, class=outcol1==pos_label)
+  roc_2 <- rocit(score=predcol2, class=outcol2==pos_label)
+  plot(roc_1, col = c("blue","green"), lwd = 3,
+       legend = FALSE, YIndex = FALSE, values = TRUE, cex=3)
+  lines(roc_2$TPR ~ roc_2$FPR, lwd = 3, col = c("red","green"), cex=3)
+  legend("bottomright", col = c("blue","red", "green"),
+         c("Train", "Test", "Null Model"), lwd = 2, cex=2)
+}
+
+logLikelihood <- function(ytrue, ypred) {
+  sum(ifelse(ytrue==pos_label, log(ypred), log(1-ypred)), na.rm=T)
+}
+
+logNull <- logLikelihood(
+  calibration_data[,outcome], sum(calibration_data[,outcome]==pos_label )/nrow(calibration_data)
+)
+
+performanceMeasures <- function(ytrue, ypred, model.name = "model") {
+  # compute the normalised deviance
+  dev.norm <- -2 * logLikelihood(ytrue, ypred)/length(ypred)
+  # compute the confusion matrix
+   cmat <- table(actual = ytrue, predicted = ypred)
+  accuracy <- sum(diag(cmat)) / sum(cmat)
+  precision <- cmat[2, 2] / sum(cmat[, 2])
+  recall <- cmat[2, 2] / sum(cmat[2, ])
+  f1 <- 2 * precision * recall / (precision + recall)
+  data.frame(model = model.name, precision = precision,
+             recall = recall, f1 = f1, dev.norm = dev.norm)
+}
+# 
+# trainperf_df <- performanceMeasures(
+#   ytrain, pred_train >= threshold, model.name="training")
+# testperf_df <- performanceMeasures(
+#   ytest, pred_test >= threshold, model.name="test")
+
+
+pretty_perf_table <- function(pred_train, pred_test ,training,test) {
+  library(pander)
+  # setting up Pander Options
+  panderOptions("plain.ascii", TRUE)
+  panderOptions("keep.trailing.zeros", TRUE)
+  panderOptions("table.style", "simple")
+  perf_justify <- "lrrrr"
+  # comparing performance on training vs. test
+ 
+  truth_train <- training[, "LEVEL"]
+  
+  truth_test <- test[, "LEVEL"]
+  trainperf_tree <- performanceMeasures(
+    pred_train, truth_train, "training")
+  testperf_tree <- performanceMeasures(
+    pred_test, truth_test, "test")
+  perftable <- rbind(trainperf_tree, testperf_tree)
+  
+  pandoc.table(perftable, justify = perf_justify)
+}
+
+
+
+model_evaluation = function( train, test, pos = pos_label, model, threshold = 0.5, type = NULL, pred_train, pred_test){
+  # ROC plot
+  
+  
+  plot_roc2(pred_train, train[, outcome], pred_test, test[, outcome] )
+  
+  
+  
+  ### confusion matrix
+  conf_mat = table(test$LEVEL, as.numeric(pred_test > threshold)) 
+  ### Performance Measure
+  pretty_perf_table(pred_train>threshold, pred_test>threshold, train, test)
+  library(knitr)
+  print(kable(conf_mat))
+  ### Density Plot
+  
+  temp_data = test
+  temp_data$prediction = pred_test
+  
+  p1 = ggplot(data= temp_data) +
+    geom_density(aes(x = prediction,color=as.factor(LEVEL)))+
+    ass2_theme
+    
+  print(p1)
+  
+  ## precision and Recall and f1 score
+  
+  perf_prec = performance(prediction(pred_test, test[,outcome]), measure = "prec")
+  perf_rec = performance(prediction(pred_test, test[,outcome]), measure = "rec")
+  
+  thresh = perf_prec@x.values[[1]]
+  precision = perf_prec@y.values[[1]]
+  recal = perf_rec@y.values[[1]]
+  f1_score = 2*precision*recal/(precision + recal)
+  p2 = ggplot() + geom_line(aes(x = thresh, y = f1_score), colour = "red")+
+    ass2_theme
+  print(p2)
+  ### AUC
+  aucTrain <- calcAUC(pred_train, train[,outcome])
+  
+  aucCal <- calcAUC(pred_test, test[,outcome])
+  print(sprintf(
+  "trainAUC: %4.3f; calibrationAUC: %4.3f",
+  aucTrain, aucCal))
+
+  
+}
+```
+
+
+### Selecting variables
+```{r}
+
+# 
+pred_var = names(calibration_data)[grepl("pred", names(calibration_data))]
+var_cor = cor(training_data[pred_var])
+pred_var = setdiff( pred_var, c("predOPERATOR_ID", "predCONTROLLER_ID") )
+```
+I eliminate one of a pair of variables with high correlation, namely, predOPERATOR_ID and predCONTROLLER_ID.
+
+## Decision Tree
+
+
+
+```{r}
+library(rpart)
+
+#predicted values from Single viable model are used because the categorical variables have a larger number of levels.
+
+formula = paste("LEVEL" , paste(pred_var, collapse =  "+"),sep = "~" )
+D_tree = rpart( formula , data = training_data)
+
+```
+
+```{r}
+## Use Predictions to creat model if you want to Plot
+library(rpart.plot)
+rpart.plot(D_tree)
+```
+The decision tree suggests that Mines, Contractor operating the mines, and accident type are the determining factors for the level of Injury for each incident. E.G. the incidents might be highly influenced by the adherence to safety standards by the contractor and underlying risk involved in working at different mines. I test how good the model is.
+
+```{r}
+model_evaluation(training_data,calibration_data, model =D_tree, pred_test = predict(D_tree, newdata = calibration_data),  pred_train = predict(D_tree, newdata = training_data))
+```
+With an AUC of 0.553, the decision tree model is better than the best single variable "Calender year" and the NUll model, both of which have an AUC of 0.5. The model is still inaccurate at predicting our LEVEL of choice, CRIRICAL injuries ie 1. Adjusting the threshold value might give better results but from the density plot, it is clear that the model is unable to differentiate the two LEVES of injury because there is significant overlap of the probability values given to each level. The two levels' prediction values are mostly below 0.375. Thus even though the model is better than the null model, it is not useful for explaining or predicting CRITICAL injuries
+
+Trying new threshold value
+```{r}
+thresholds = unique(predict(D_tree, newdata = calibration_data)) ### using predicted values as threshold
+table(predict(D_tree, newdata = calibration_data) > thresholds[1], calibration_data[, outcome])
+table(predict(D_tree, newdata = calibration_data) > thresholds[3], calibration_data[, outcome])
+```
+There is an increase in the number of correctly identified CRITICAL INJURIES, but I also get an increase in the number of false positive. IE adjusting the threshold value increases the model sensitivity but decreases specificity making the model unusable
+
+## Logistic Regression
+
+```{r}
+## using train to perform logistic regression for future explanation
+model <- caret::train(x = training_data[pred_var], y = as.factor(training_data[,outcome]),
+               method = "glm", family = binomial(link="logit"))
+```
+
+```{r warning=FALSE}
+### 
+
+
+explainer = lime(training_data[,pred_var], model = model , 
+                  bin_continuous = TRUE)
+case1 <- c("3593")
+case2 <- c("3485")
+explanation1 = explain(calibration_data[case1,pred_var], explainer, n_labels = 1, n_features = length(pred_var)) 
+
+explanation2 = explain(calibration_data[case2,pred_var], explainer, n_labels = 1, n_features = length(pred_var)) 
+plot_features(explanation1)
+plot_features(explanation2)
+```
+The logistic regression model, much like decision trees,  places an emphasis on contractor_ID, mine_ID and Accident type to differentiate the two levels, but there are additional variables that affect the labeling e.g. Mining equipment .That said, 1/2 of the labels predicted are  incorrect  but the small sample size might be a reason for this observation.
+
+Further exploration
+```{r}
+
+formula = paste("LEVEL" , paste(pred_var, collapse =  "+"),sep = "~" )
+log_model  = glm(formula = formula, data = training_data, family = "binomial")
+summary(log_model)
+```
+From the summary, UG_LOCATION, MINING_METHO,SHIFT_BEGIN_TIME, ACCIDENT_TIME and COAL_METAL_IND have the lowest significance. Simplifying the model by eliminating these two might give a better model.
+
+```{r}
+model_evaluation(training_data,calibration_data, model =log_model, pred_test = predict(log_model, newdata = calibration_data, type = "response"),  pred_train = predict(log_model, newdata = training_data, type = "response"), threshold = 0.5)
+```
+
+Even though the AUC of the  model is 0.766 for the training data and and the ROC plot show a decent specificity, sensitivity trade off, the density plot and confusion matrix supports the notion that the model is unable to differentiate between the two levels. Less than 20% of CRITICAL INJURIES are correctly Identified and there is significant overlap in the predicted probabilities for the two levels.
+That being said, it's AUC is better than the decision tree's AUC but the decision tree does a better job of Identifying critical Injuries. 
+The f1_score v threshold graph suggests lowering the graph to improve the model's performance on either recall or precision.
+
+
+Eliminating insignificant variables nad lowerig the threshold score
+```{r}
+## using train to perform logistic regression for future explanation
+model2 <- caret::train(x = training_data[setdiff(pred_var,c( "predUG_LOCATION", "predUG_MINING_METHOD" ,"predCOAL_METAL_IND", "predSHIFT_BEGIN_TIME", "predSHIFT_BEGIN_TIME_isBAD", "predACCIDENT_TIME","predACCIDENT_TIME_isBAD" ))], y = as.factor(training_data[,outcome]),
+               method = "glm", family = binomial(link="logit"))
+```
+
+
+
+```{r}
+formula2 = paste("LEVEL" , paste(setdiff(pred_var,c( "predUG_LOCATION", "predUG_MINING_METHOD" ,"predCOAL_METAL_IND", "predSHIFT_BEGIN_TIME", "predSHIFT_BEGIN_TIME_isBAD", "predACCIDENT_TIME","predACCIDENT_TIME_isBAD" )), collapse =  "+"),sep = "~" )
+
+log_model_sel  = glm(formula = formula2, data = training_data, family = "binomial")
+summary(log_model_sel)
+calcAUC(predict(log_model_sel, type = "response"), training_data[,outcome])
+
+```
+
+Selecting Threshold value to maximize number of correctly identified CRITICAL injuries
+```{r  message=FALSE, results='hide', warning=FALSE}
+temp_pred = data.frame( pred = predict(log_model, newdata = training_data[training_data$LEVEL == 1,], type = "response"))
+temp_count = temp_pred %>% group_by(pred) %>% count()
+temp_count[temp_count$pred == max(temp_count$pred[temp_count$pred  < 0.01625] ) ,]
+# selecting point with highest density of CRITICAL INJURIES as the threshold
+
+```
+
+
+```{r}
+model_evaluation(training_data,calibration_data, model =log_model_sel, pred_test = predict(log_model, newdata = calibration_data, type = "response"),  pred_train = predict(log_model, newdata = training_data, type = "response"),threshold = 	
+0.01624206)
+```
+Removing the three variables does nothing to improve the models ability to differentiate between the two class but it does provide a more concise model void if insignificant variables.
+Reducing the threshold value give a better result, approximately 50%critical values correctly identified, but the false positives increase by more than 100%, to 25% of non critical data. Once again, the model sensitivity for CRITICAL injuries increases but it's specificity decreases. That being said this is our best model so far.
+
+#### Xgboost
+```{r}
+
+leve_fit_fun = function(variable_matrix, labelvec) {
+  cv <- xgb.cv(variable_matrix, label = labelvec,
+               params=list(
+                 objective="binary:logistic"
+               ),
+               nfold=5,
+               nrounds=1000,
+               print_every_n=10,
+               metrics="logloss")
+
+  evalframe <- as.data.frame(cv$evaluation_log)
+  NROUNDS <- which.min(evalframe$test_logloss_mean)
+
+  model <- xgboost(data=variable_matrix, label=labelvec,
+                   params=list(
+                     objective="binary:logistic"
+                   ),
+                   nrounds=NROUNDS,
+                   verbose=FALSE)
+
+  model
+}
+
+
+```
+
+
+```{r  message=FALSE, results='hide', warning=FALSE}
+xgboost =leve_fit_fun(as.matrix(training_data[pred_var]), training_data$LEVEL)
+```
+
+
+```{r  message=FALSE, results='hide', warning=FALSE}
+temp_pred = data.frame( pred = predict(xgboost, newdata = as.matrix(training_data[pred_var])))
+temp_count = temp_pred %>% group_by(pred) %>% count()
+temp_count[temp_count$pred == max(temp_count$pred[temp_count$pred  < 0.01625] ) ,]
+```
+
+
+```{r}
+model_evaluation(training_data, calibration_data, model = xgboost, pred_train = predict(xgboost, newdata = as.matrix(training_data[pred_var])), pred_test = predict(xgboost, newdata = as.matrix(calibration_data[pred_var])), threshold = 0.0162)
+```
+
+The model Performance is similar to our best model but less false positives and less true positives.
+
+### Testing best model
+
+```{r}
+model_evaluation(rbind(training_data, calibration_data),test_data, model =log_model_sel, pred_test = predict(log_model, newdata = test_data, type = "response"),  pred_train = predict(log_model, newdata = rbind(training_data, calibration_data), type = "response"),threshold = 	
+0.01624206)
+```
+The performance of the model is very similar to our result from the Calibration data. This model is not useful for prediction in Critical injuries. The issue might lie with the arbitrary grouping or the simplicity of the model, I investigate if clustering method can infer relationships in the data that our current model can not.
+
+## Clustering
+
+I rely on Hierarchical Clustering because it is good at identifying outlier. THis is important seeing as our data is skewd to Non_critical injuries.
+```{r}
+## under sampling
+level_0 = sample(size = 5000,x = 1:sum(training_data$LEVEL == 0 ), replace = T)
+training_data_0 = training_data[training_data$LEVEL == 0, ]
+dTrain = rbind(training_data_0[level_0,], (training_data[training_data$LEVEL == 1,])[rep(1:sum(training_data$LEVEL == 1 ),2),] )
+
+```
+
+
+```{r}
+## under sampling of the prevelant NON-CRITICAL injuries
+level_0 = sample(size = 5000,x = 1:sum(calibration_data$LEVEL == 0 ), replace = F)
+calib_data_0 = calibration_data[calibration_data$LEVEL == 0, ]
+dCalib = rbind(calib_data_0[level_0,], (calibration_data[calibration_data$LEVEL == 1,])[rep(1:sum(calibration_data$LEVEL == 1 ),10),] )
+
+
+```
+
+clustering
+```{r}
+h_clust = hclust(dist(dTrain[pred_var]), method = "ward.D")
+cluster_sep = cutree(h_clust, 2)
+table(cluster_sep)
+```
+
+
+Extract and compare clusters
+```{r}
+clust1 = dTrain[names(cluster_sep)[cluster_sep == 1],]
+clust2 = dTrain[names(cluster_sep)[cluster_sep == 2],]
+
+sprintf("Non_critical injuries in the first cluster ==  %d, critical injuries in the second cluster ==  %d", sum(clust1$LEVEL == 0), sum(clust1$LEVEL == 1))
+
+sprintf("Non_critical injuries in the second cluster ==  %d, critical injuries in the second cluster ==  %d", sum(clust2$LEVEL == 0), sum(clust2$LEVEL == 1))
+
+
+```
+The first cluster has a mixture of CRITICAL and NON-CRITICAL injuries but the second cluster is 97% Critical injuries. Which suggests that there are common underlying factors causing CRITICAL injuries in specific situations.
+
+Exploring Degree of injury in the second cluster
+```{r}
+table(clust2$DEGREE_INJURY)
+```
+The cluster contains a good mixture of the two types of CRITICAL injury. Before Performing further assessment on the cluster. I investigate if there is a better choice for cluster number.
+
+Set up for calculating CH critereon.
+```{r}
+# code Adopted from week 11 lecture, Computational Data analysis, 
+## Function to return the squared Euclidean distance of two given points x and y
+sqr_euDist <- function(x, y) {
+  sum((x - y)^2)
+}
+# Function to calculate WSS of a cluster, represented as a n-by-d matrix
+# (where n and d are the numbers of rows and columns of the matrix)
+# which contains only points of the cluster.
+wss <- function(clustermat) {
+  c0 <- colMeans(clustermat)
+  sum(apply( clustermat, 1, FUN=function(row) {sqr_euDist(row, c0)} ))
+}
+# Function to calculate the total WSS. Argument `scaled_df`: data frame
+# with normalised numerical columns. Argument `labels`: vector containing
+# the cluster ID (starting at 1) for each row of the data frame.
+wss_total <- function(scaled_df, labels) {
+  wss.sum <- 0
+  k <- length(unique(labels))
+  for (i in 1:k)
+  wss.sum <- wss.sum + wss(subset(scaled_df, labels == i))
+  wss.sum
+}
+# Function to calculate total sum of squared (TSS) distance of data
+# points about the (global) mean. This is the same as WSS when the
+# number of clusters (k) is 1.
+tss <- function(scaled_df) {
+  wss(scaled_df)
+}
+# Function to return the CH indices computed using hierarchical
+# clustering (function `hclust`) or k-means clustering (`kmeans`)
+# for a vector of k values ranging from 1 to kmax.
+CH_index <- function(scaled_df, kmax, method="hclust", h_clust_m = "complete") {
+  if (!(method %in% c("kmeans", "hclust")))
+    stop("method must be one of c('kmeans', 'hclust')")
+  npts <- nrow(scaled_df)
+  wss.value <- numeric(kmax) # create a vector of numeric type
+  # wss.value[1] stores the WSS value for k=1 (when all the
+  # data points form 1 large cluster).
+  wss.value[1] <- wss(scaled_df)
+  if (method == "kmeans") {
+  # kmeans
+    for (k in 2:kmax) {
+      clustering <- kmeans(scaled_df, k, nstart=10, iter.max=100)
+      wss.value[k] <- clustering$tot.withinss
+    }
+  } else {
+  # hclust
+    d <- dist(scaled_df, method="euclidean")
+    pfit <- hclust(d, method=h_clust_m)
+    for (k in 2:kmax) {
+      labels <- cutree(pfit, k=k)
+      wss.value[k] <- wss_total(scaled_df, labels)
+    }
+  }
+  bss.value <- tss(scaled_df) - wss.value # this is a vector
+  B <- bss.value / (0:(kmax-1)) # also a vector
+  W <- wss.value / (npts - 1:kmax) # also a vector
+  data.frame(k = 1:kmax, CH_index = B/W, WSS = wss.value)
+}
+```
+
+CH criteon
+```{r}
+criterion_hcl <- CH_index(dTrain[pred_var], 15, method="hclust", h_clust_m = "ward.D")
+
+```
+
+```{r}
+ggplot() +
+geom_point(data = criterion_hcl, aes(x=k, y=CH_index), colour="red") + geom_line(colour="red", data = criterion_hcl, aes(x=k, y=CH_index))  +
+scale_x_continuous(breaks=1:15, labels=1:15) + 
+labs(y="CH index") + theme(text=element_text(size=20))+
+ass2_theme
+```
+CH-criterion suggests a cluster 13 for Hierarchical clustering. I will investigate other cluster numbers and compare stability.
+
+### Exploring stability of clusters using Jacard coefficient.
+```{r}
+boost2 = list()
+for(i in 13:15){
+  cboot.hclust2 <- clusterboot(dTrain[pred_var], clustermethod=hclustCBI,
+method="ward.D", k = i)
+  boost2[[i -12]] = 1 - cboot.hclust2$bootbrd/100
+
+
+}
+```
+
+
+```{r}
+comparison2 = data.frame(  "Number of Clusters " =  13 , "unstable %" = sum(boost2[[1]] < 0.6)/ length(boost2[[1]]),"low Cert Clusters %" = sum(boost2[[1]] >= 0.6 & boost2[[1]] < 0.75)/ length(boost2[[1]]), "mid Cert Clusters %" = sum(boost2[[1]] >= 0.75 & boost2[[1]] < 0.85)/ length(boost2[[1]]),  "high Cert Clusters %" = sum(boost2[[1]] >= 0.85)/ length(boost2[[1]]))
+for(i in 2:3){
+  comparison2 = rbind(comparison2, data.frame(  "Number of Clusters " =  i +12 , "unstable %" = sum(boost2[[i ]] < 0.6)/ length(boost2[[i]]),"low Cert Clusters %" = sum(boost2[[i]] >= 0.6 & boost2[[i]] < 0.75)/ length(boost2[[i]]), "mid Cert Clusters %" = sum(boost2[[i]] >= 0.75 & boost2[[i]] < 0.85)/ length(boost2[[i]]),  "high Cert Clusters %" = sum(boost2[[i]] >= 0.85)/ length(boost2[[i]])))
+}
+
+
+sprintf("Jacard coiffiecient for %d clusters is:", 13)
+print(boost2[[1]])
+sprintf("Jacard coiffiecient for %d clusters is:", 2)
+print(boost2[[2]])
+```
+Hierarchical clustering with 14 clusters has the highest proportion of high certainty clusters but the total number of unstable clustering and low_certainty clusters is higher than for Hierarchical with 13 clusters. I expect to witness increased stability with higher cluster number.
+This would suggests cluster number of 13 is more suitable. 
+### Explore make up of clusters in terms of Injury Level.
+```{r}
+num_cluster = 13
+cluster_sep = cutree(h_clust,num_cluster   )
+tot = 0
+for(i in 1:num_cluster){
+ 
+  print(sprintf("Non_critical injuries in the cluster %d ==  %d, critical   injuries in the second cluster ==  %d",i,  sum(dTrain[names(cluster_sep)[cluster_sep == i],"LEVEL"] == 0),  sum(dTrain[names(cluster_sep)[cluster_sep == i],"LEVEL"] == 1)))
+tot = tot + sum(dTrain[names(cluster_sep)[cluster_sep == i],"LEVEL"] == 1) 
+}
+
+
+```
+Hierarchical clustering is able to Isolate CRITICAL injuries into specific clusters at a high probability but this is still only 35% of CRITICAL level injuries. The other 65% are in clusters 1-4 which contain a mixture of CRITICAL and NON-CRITICAL injuries.
+
+### Visualising Graph for better comparison
+
+```{r}
+cluster_sep = cutree(h_clust,13 )
+cluster_sep = sample(size = 300, x = cluster_sep[cluster_sep  >= 6 & cluster_sep <= 11])
+princ <- prcomp(dTrain[pred_var]) # Calculate the principal components 
+nComp <- 2 
+project2D <- as.data.frame(predict(princ, newdata=dTrain[ names(cluster_sep),pred_var])[,1:nComp])
+# combine with `groups` and df$Country to form a 4-column data frame
+hclust.project2D <- cbind(project2D, cluster=as.factor(cluster_sep), level = dTrain[names(cluster_sep),"LEVEL"])
+```
+
+
+
+```{r}
+
+library('grDevices')
+find_convex_hull <- function(proj2Ddf, cluster_sep) {
+  do.call(rbind,
+    lapply(unique(cluster_sep),
+      FUN = function(c) {
+      f <- subset(proj2Ddf, cluster==c);
+      f[chull(f),]
+    }
+    )
+  )
+}
+hclust.hull <- find_convex_hull(hclust.project2D, cluster_sep)
+
+```
+
+Visualizing last 6 clusters
+```{r}
+ggplot(hclust.project2D, aes(x=PC1, y=PC2)) +
+  geom_point(aes(shape=cluster, color=cluster)) +
+  geom_polygon(data=hclust.hull, aes(group=cluster, fill=as.factor(cluster)),
+  alpha=0.4, linetype=0) + theme(text=element_text(size=20)) +
+  ass2_theme
+```
+There seems to be some good distance between cluster 8 and 11, I explore this and more below.
+
+Exploring clusters
+```{r  message=FALSE, results='hide', warning=FALSE}
+
+lapply(dTrain[names(cluster_sep)[cluster_sep == 11],setdiff(names(training_data), names(training_data)[grepl("pred", names(training_data) )])], table)
+lapply(dTrain[names(cluster_sep)[cluster_sep == 8],setdiff(names(training_data), names(training_data)[grepl("pred", names(training_data) )])], table)
+```
+ There are some difference between the clusters that mainly have CRITICAL injuries and those that have a mixture, and the clustering seem to depend on a multitude of factors. On a rudimentary level, Clusters 5 - 13, seem to have more metal Mines, whereas the first 3 have a mixture of the two. Clusters 5 - 13 differ mainly on Mining equipment, accident type, occupation. EG cluster 8 has a larger number of Maintenance crew working on Conveyor belts, who sustained injuries from falls, While cluster 10 has more truck drivers caught in between or under stationary or moving objects.
+
+
+## Conclusion
+I used data from US Accident Injury Dataset and classification  models to train models and predict if an injury would be CRITICAL or NON-CRITICAL. The best classification model was the Logistic regression whose performance was slightly better than Xgboost model but both models still perform Abysmally whEn predicting CRITICAL INJURRIES but excelled at predicting NON-CRITICAL INJURIES. With the hierarchical clustering model was able to identify some patterns with a portion of the data, using Mining equipment, accident type and occupation in some cases to separate the clusters. Seeing as the clustering was able to unerth some patterns, maybe a multiclass classification model might perform better than my current method.
+
